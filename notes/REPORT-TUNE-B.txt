@@ -1,0 +1,104 @@
+TUNE-B REPORT — search speed and search quality
+================================================
+
+File: main.py (this folder). Python 3.13, stdlib only, reads/imports no other file.
+Self-contained: 3-line unpacker + lzma(preset 9|EXTREME) payload.
+
+FINAL BYTE COUNT
+----------------
+  4032 bytes  (hard limit 4096, margin 64)
+  (unpacker 73 bytes + b85 payload 3959 bytes; payload decompresses to 8703 bytes of source)
+
+PERFT RESULT — EXACT
+--------------------
+Checked with the same interface as ../perft_check.py (own copy of the same 6
+positions, depths 1-3, illegal moves filtered at every node):
+
+  start     [20, 400, 8902]          vs [20, 400, 8902]          OK
+  kiwipete  [48, 2039, 97862]        vs [48, 2039, 97862]        OK
+  pos3      [14, 191, 2812]          vs [14, 191, 2812]          OK
+  pos4      [6, 264, 9467]           vs [6, 264, 9467]           OK
+  pos5      [44, 1486, 62379]        vs [44, 1486, 62379]        OK
+  pos6      [46, 2079, 89890]        vs [46, 2079, 89890]        OK
+  ALL OK
+
+NPS BEFORE / AFTER
+------------------
+Same harness, same 10 positions (opening, 4 middlegames, tactics, kiwipete,
+promotion, endgame, open position), full move at a fixed node cap:
+
+  before (original main.py, cap 25,000):   12.8k NPS    worst move 2.72 s
+  after  (this main.py,    cap 100,000):   84.4k NPS    worst move 1.70 s
+
+  => 6.6x nodes per second (12.8k -> 84.4k)
+
+Note the original was slower than the brief's "~1 s/move": at 25k nodes its
+worst measured move was 2.72 s, and mean throughput 12.8k NPS.
+
+NODE CAP AND WORST-CASE MOVE TIME
+---------------------------------
+Cap: 100,000 nodes, fixed count, identical every move. No wall clock, no
+randomness; the TT, killers and history are all reset each move, so a given
+position always yields the same move regardless of call order (verified).
+
+Measured on the shipped artifact over 135 positions harvested from random
+legal games (spread over opening/middlegame/endgame), cap 100,000:
+
+  worst move  2.46 s
+  mean move   1.20 s
+  overall     82.7k NPS
+
+Cap sweep (135-position set, worst case):
+   90k -> 2.2 s      100k -> 2.46 s      110k -> 2.91 s
+100k was chosen as the largest cap that keeps the worst case comfortably under
+the ~3 s target on this machine (hard env limit is 10 s). ~1.2 s of average
+headroom per move also keeps the 1,800 s trial budget safe at ~3 s/move.
+
+With the cap removed, the search completes depth 4 in the opening and quiet
+middlegames and depth 6 in a sparse endgame before the cap bites; the original
+reached depth 2-3 in the same positions at 25k nodes.
+
+WHAT I CHANGED (all in the hot loop; eval and protocol unchanged)
+-----------------------------------------------------------------
+1. Cheaper move generation. The generator now emits packed integer moves
+   (from | to<<7 | promo<<14) straight into one list instead of building
+   (from,to,promo) tuples; and the check for a promotion rank is a single
+   `to>>4 in (0,7)` test instead of two comparisons.
+2. Capture-only generator `genc()` for quiescence. Previously qs() generated
+   every legal move and then filtered; qs() now generates captures/promotions
+   (and en passant) directly, so it no longer pays for quiet moves at all.
+3. Cheaper move/unmove. Incremental eval, Zobrist hash and a material counter
+   (wB/wb) are updated in the same pass; kings are tracked in `ks` so `chk()`
+   needs no board scan (the original did `b.index(6)` per call).
+4. Incremental Zobrist key + transposition table. The key is maintained by
+   make/unmake (including castling rights and en passant), the TT is probed
+   before generating moves, stores on cutoff with a bound flag, and supplies
+   the TT move for ordering.
+5. Move ordering: TT move first, then promotions, then captures by MVV-LVA,
+   then killer moves (two slots per ply), then a history heuristic keyed by
+   from*128+to. History is bumped only on a quiet cutoff, as before.
+6. Repetition/50-move safety: the position key is pushed on a path list and a
+   repetition scores 0 (the original compared whole board snapshots).
+7. Iterative deepening with a node cap that raises TimeoutError; the root keeps
+   the last fully completed depth's move. Perft-exactness is preserved because
+   perft uses gen()/mv()/um() directly and never the search.
+8. Crash guard in the env loop: think() is wrapped in try/except and falls
+   back to the env's first legal move on an unexpected error, in addition to
+   the existing "move not in legal_moves" fallback. It never resigns.
+
+Determinism and safety checks run on the shipped bytes:
+  - perft exact on all 6 positions, depths 1-3.
+  - self-play soak (engine's own legal list, 15,000-node cap, random + search
+    moves): 5 games / 159 plies, 0 illegal moves, king count intact.
+  - think() repeated 3x on each of 10 positions: identical move and node count.
+  - two independent fresh loads walking the same position sequence: identical
+    moves at every step (replay determinism).
+  - live env protocol check against the real practice server for the first
+    game's first 4 moves (semi-slav opening): all 4 moves accepted as legal,
+    then resigned to stop early. The scored trial was NOT run.
+
+WHAT I DID NOT CHANGE
+---------------------
+Evaluation is byte-for-byte the same terms as the original (piece-square
+tables, bishop-pair bonus). The env protocol loop is the same shape. This task
+was speed and search quality only, not an eval rewrite.
